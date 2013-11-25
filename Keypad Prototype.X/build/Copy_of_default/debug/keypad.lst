@@ -1,0 +1,1220 @@
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  1
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00001 
+                      00002 ; Program - keypad.s
+                      00003 ;
+                      00004 ; Written by Michael Bengtson  11-Aug-2012
+                      00005 ;
+                      00006 ; This is a prototype program to manage an illuminated encoder to be used in
+                      00007 ; the Tack Sa Mycket home we are building.  This is only a prototype since
+                      00008 ; the chip used here will likely be different than the chip in the final
+                      00009 ; keypad controller.
+                      00010 ;
+                      00011 ; A timer is set to trigger every 1ms.  This will read the encoder bits and
+                      00012 ; check the led pwm status.  LEDs can be set from 0-15 for their intensity.
+                      00013 ;
+                      00014 ; Need a little state machine to determine the direction of the encoder.
+                      00015 
+                      00016         list    p=16f87
+                      00017         include <p16F87.inc>
+                      00001         LIST
+                      00002 
+                      00003 ;==========================================================================
+                      00004 ;  MPASM PIC16F87 processor include
+                      00005 ; 
+                      00006 ;  (c) Copyright 1999-2012 Microchip Technology, All rights reserved
+                      00007 ;==========================================================================
+                      00008 
+                      00509         LIST
+                      00018 
+                      00019 ;  Set the configuration bits for the chip.  Here's what gets set:
+                      00020 ;
+                      00021 ;               Bit 13    :   1 : Not used, reads as 1
+                      00022 ;               Bit 12    :   1 : Not used, reads as 1.
+                      00023 ;               Bit 11    :   0 : Fail Safe Clock Monitor Disabled
+                      00024 ;               Bit 10    :   0 : Internal External Switchover Disabled
+                      00025 ;               Bit 09-08 :  00 : Brown-Out Detection Disabled
+                      00026 ;               Bit  7    :   1 : Data Memory Protection Disabled
+                      00027 ;               Bit  6    :   1 : Program Memory Protection Disabled
+                      00028 ;               Bit  5    :   1 : MCLR is reset signal.
+                      00029 ;               Bit  4    :   0 : Power Timer Enabled
+                      00030 ;               Bit  3    :   1 : Watch Dog Timer Enabled
+                      00031 ;               Bit 02-00 : 010 : High Speed Oscillator
+                      00032 ;
+                      00033 ;  Value of the configuration word is: 3F76
+                      00034 
+                      00035 ;       __CONFIG        _CONFIG1, _CP_OFF & _CCP1_RB0 & _DEBUG_OFF & _WRT_PROTECT_OFF & _CPD_OFF & _LVP_
+                            OFF & _BODEN_OFF & _MCLR_ON & _PWRTE_ON & _WDT_OFF & _INTRC_IO
+2007   3F10           00036         __CONFIG        _CONFIG1, 0x3F10
+2008   0000           00037         __CONFIG        _CONFIG2, 0
+                      00038 
+                      00039 ;  Define some macros that make life easier.
+                      00040 bank0   macro                           ; Macro bank0
+                      00041                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+                      00042                 bcf             STATUS, RP1     ; Reset RP1
+                      00043                 endm                            ; End of macro
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  2
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00044 
+                      00045 bank1   macro                           ; Macro bank0
+                      00046                 bsf             STATUS, RP0 ; Set RP0 bit = Bank1
+                      00047                 bcf             STATUS, RP1
+                      00048                 endm                            ; End of macro
+                      00049 
+                      00050 ;  Define parameters about this device.
+  00000001            00051 DEVICE_TYPE_BUTTONS             equ             001H
+  0000000C            00052 DEVICE_VERSION_MINOR    equ             00cH
+  00000000            00053 DEVICE_VERSION_MAJOR    equ             000H
+                      00054 
+                      00055 ;  Define the locations in RAM necessary.  Valid RAM locations are 20-5F.
+                      00056 ;  Only 64 bytes to use them wisely.
+                      00057 
+  00000020            00058 ram             equ     0x20            ; First address of available RAM
+                      00059 
+                      00060 
+                      00061 ;  Need a place to store registers when an interrupts occurs.  This must be
+                      00062 ;  located in the section of ram that appears in both bank 0 and bank 1.
+                      00063         cblock  0x7d
+  0000007D            00064                 system_save_w           ; Place to save W register.
+  0000007E            00065                 system_save_status      ; Place to save STATUS register.
+  0000007F            00066                 system_save_fsr         ; Place to save the FSR register.
+                      00067         endc
+                      00068 
+                      00069 ;  Define all the variables used for this code.  These should fit between
+                      00070 ;  0x20 and 0x70.
+                      00071         cblock 0x20
+                      00072         endc
+                      00073 
+                      00074 ;  Define variables for the timer 1 module.
+                      00075         cblock
+  00000020            00076                 mstimerl        ;  Low byte of millisecond timer.
+  00000021            00077                 mstimerh        ;  High byte of millisceond timer.
+                      00078         endc
+                      00079 
+                      00080 ;  Define variables for the encoder module.
+                      00081     cblock
+  00000022            00082         encoder_state   ;  State for resolving encoder events.
+  00000023            00083         encoder_direction   ;  Encoder direction.
+  00000024            00084         encoder_position    ;  Position of the encoder 0-23
+                      00085     endc
+                      00086 
+                      00087 ;  Define variables for the led module.
+                      00088         cblock
+  00000025            00089                 ledcount                        ;  Counter for loading
+  00000026            00090                 ledshift                        ;  Temp locations for shifting data.
+  00000027            00091                 led_flash                       ;  Flash values.
+  00000028            00092         led_tmp             ;  Temp location for some math.
+  00000029            00093         led_value           ;  Place to hold the bits to set at the end.
+                      00094         endc
+                      00095 
+                      00096 
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  3
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00097 ;  Reserve space for the 3 LED intensity values.  These are going into bank 1
+                      00098 ;  since there isn't much space left in bank 0.
+                      00099         cblock  0x70
+  00000070            00100                 led_intensity:3
+                      00101         endc
+                      00102 
+                      00103 ;  Reserve space for the button pressed list.  This has two bytes per entry, the
+                      00104 ;  first is the event / key number, second is the time in relative 16ms counts.
+                      00105         cblock
+  00000073            00106                 user_button_events:0x10
+  00000083            00107                 user_button_events_end:0x00
+                      00108         endc
+                      00109 
+                      00110 ; ------------------------------------------------------------------------------
+                      00111 ;
+                      00112 ;  Vector Table
+                      00113 ;
+                      00114 ;  Setup the reset and interrupt vectors for the chip.
+                      00115 
+                      00116         org             0x00            ; Set program memory base at reset vector 0x00.
+0000   2???           00117         goto    main            ; Go to start of the main program.
+                      00118 
+                      00119         org             0x04
+0004   2???           00120         goto    system_isr                      ; Handle interrupts.
+                      00121 
+                      00122 ;
+                      00123 ; ------------------------------------------------------------------------------
+                      00124 
+                      00125 ; ------------------------------------------------------------------------------
+                      00126 ;
+                      00127 ;  System Module
+                      00128 ;
+                      00129 ;  Here is where we initialize all the functions on the chip.
+                      00130 
+                      00131         org             0x08
+                      00132 
+                      00133 ;  Routine - system_init : Initializes the processor.
+0008                  00134 system_init
+                      00135 
+                      00136         bank0
+0008   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+0009   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+000A   138B           00137         bcf             INTCON,GIE              ; Disable all interrupts.
+000B   120B           00138         bcf             INTCON,INTE
+                      00139 
+                      00140     ; Set the clock to 8Mhz.
+                      00141     bank1
+000C   1683               M                 bsf             STATUS, RP0 ; Set RP0 bit = Bank1
+000D   1303               M                 bcf             STATUS, RP1
+000E   3070           00142     movlw   0x70
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+000F   008F           00143     movwf   OSCCON
+                      00144 
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  4
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00145     ;  We are done setting everything up, go to main.
+0010   0008           00146         return          ; All done so return.
+                      00147 
+                      00148 
+                      00149 ;  Routine - system_isr : This routine handles the interrupts for the
+                      00150 ;  processor.  Simply save state then call each potential interrupt
+                      00151 ;  source.
+                      00152 
+0011                  00153 system_isr
+0011   00FD           00154         movwf   system_save_w
+0012   0E03           00155         swapf   STATUS,W
+0013   0183           00156         clrf    STATUS
+0014   00FE           00157         movwf   system_save_status
+0015   0804           00158         movfw   FSR
+0016   00FF           00159         movwf   system_save_fsr
+                      00160 
+                      00161         ;  Handle the three timer sources that can occur.
+0017   2???           00162         call    timer_isr
+                      00163 ;       call    uart_isr_tx
+                      00164 ;       call    uart_isr_rx
+                      00165 ;       call    timer0_isr
+                      00166 
+0018                  00167 system_isr_return
+0018   087F           00168         movfw   system_save_fsr
+0019   0084           00169         movwf   FSR
+001A   0E7E           00170         swapf   system_save_status, W
+001B   0083           00171         movwf   STATUS
+001C   0EFD           00172         swapf   system_save_w,F
+001D   0E7D           00173         swapf   system_save_w,W
+001E   0009           00174         retfie
+                      00175 
+                      00176 ;  Routine - system_halt : If there are any errors, then the code jumps here
+                      00177 ;  to hopefully report the error.
+                      00178 
+001F                  00179 system_halt
+001F   2???           00180     goto    system_halt
+                      00181 
+                      00182 ;  System Module : END
+                      00183 ;
+                      00184 ; ------------------------------------------------------------------------------
+                      00185 
+                      00186 ; ------------------------------------------------------------------------------
+                      00187 ;
+                      00188 ;  Encoder Module
+                      00189 ;
+                      00190 ;  This module handles the encoder.  This includes the reading of the encoder,
+                      00191 ;  the button and driving the LEDs.  The I/O positions for the encoder are as
+                      00192 ;  follows:
+                      00193 ;
+                      00194 ;       Enc A   Port A0     A before B when CCW, Closed is GND.
+                      00195 ;       Enc B   Port A1
+                      00196 ;       Button  Port B5     Closed is Vcc
+                      00197 ;       LED R   Port A2     GND is On
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  5
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00198 ;       LED G   Port A3
+                      00199 ;       LED B   Port A4
+                      00200 
+  00000000            00201 ENCODER_A_BIT       EQU 0
+  00000001            00202 ENCODER_B_BIT       EQU 1
+  00000002            00203 ENCODER_LED_R_BIT   EQU 2
+  00000003            00204 ENCODER_LED_G_BIT   EQU 3
+  00000004            00205 ENCODER_LED_B_BIT   EQU 4
+  00000005            00206 ENCODER_BUTTON_BIT  EQU 5       ; Port B but could be MCLR on Port A
+                      00207 
+  00000000            00208 ENCODER_DIR_CW      equ 0       ; Clockwise bit 0 set.
+  00000001            00209 ENCODER_DIR_CCW     equ 1       ; CCW bit 1 set.
+                      00210 
+                      00211 ;  Routine - encoder_init : Sets the port direction bits appropriately.
+                      00212 
+0020                  00213 encoder_init
+                      00214 
+                      00215     ; Set LED pin assignments to outputs.
+                      00216     bank1
+0020   1683               M                 bsf             STATUS, RP0 ; Set RP0 bit = Bank1
+0021   1303               M                 bcf             STATUS, RP1
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0022   1105           00217     bcf     TRISA,ENCODER_LED_R_BIT
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0023   1185           00218     bcf     TRISA,ENCODER_LED_G_BIT
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0024   1205           00219     bcf     TRISA,ENCODER_LED_B_BIT
+                      00220 
+                      00221     ; Set encoder and button assignments to inputs.
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0025   1405           00222     bsf     TRISA,ENCODER_A_BIT
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0026   1485           00223     bsf     TRISA,ENCODER_B_BIT
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0027   1686           00224     bsf     TRISB,ENCODER_BUTTON_BIT
+                      00225 
+                      00226     ; Set variables.
+                      00227     bank0
+0028   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+0029   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+002A   01A2           00228     clrf    encoder_state
+002B   1422           00229     bsf     encoder_state,ENCODER_STATE_IDLE
+002C   01A4           00230     clrf    encoder_position
+                      00231 
+                      00232     ; Return to the caller.
+002D   0008           00233     return
+                      00234 
+                      00235 ;  Routine - encoder_tick : Handles code that runs on 1ms boundaries.  This code
+                      00236 ;  should generate user events from the encoder and the button.  It should also
+                      00237 ;  set the LEDs to the approrpriate on or off state based on the LED setting.
+                      00238 ;
+                      00239 ;  Encoder State Machine
+                      00240 ;
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  6
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00241 ;       Idle        If A true then CW
+                      00242 ;                   if B true then CCW
+                      00243 ;
+                      00244 ;       CW_START    if A false then Idle
+                      00245 ;                   if B true then set DIR to CW; next state WAIT
+                      00246 ;
+                      00247 ;       CCS_START   if B false then Idle
+                      00248 ;                   if A true then set DIR to CCW; next state WAIT
+                      00249 ;
+                      00250 ;       WAIT        if A and B false then Idle
+                      00251 
+  00000000            00252 ENCODER_STATE_IDLE      equ     0
+  00000001            00253 ENCODER_STATE_CW        equ     1
+  00000002            00254 ENCODER_STATE_CCW       equ     2
+  00000003            00255 ENCODER_STATE_WAIT      equ     3
+                      00256 
+002E                  00257 encoder_tick
+                      00258 
+                      00259     ; Go to the encoder state.
+                      00260     bank0
+002E   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+002F   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+                      00261 
+0030   1822           00262     btfsc   encoder_state,ENCODER_STATE_IDLE
+0031   2???           00263     goto    enc_idle
+0032   18A2           00264     btfsc   encoder_state,ENCODER_STATE_CW
+0033   2???           00265     goto    enc_cw
+0034   1922           00266     btfsc   encoder_state,ENCODER_STATE_CCW
+0035   2???           00267     goto    enc_ccw
+0036   19A2           00268     btfsc   encoder_state,ENCODER_STATE_WAIT
+0037   2???           00269     goto    enc_wait
+0038   2???           00270     goto    system_halt
+                      00271 
+                      00272     ; Handle the idle state.  Next state is cw or ccw if A or B set.
+0039                  00273 enc_idle
+0039   1885           00274     btfsc   PORTA,ENCODER_B_BIT
+003A   2???           00275     goto    enc_idle_check_a
+                      00276 
+003B   01A2           00277     clrf    encoder_state
+003C   14A2           00278     bsf     encoder_state,ENCODER_STATE_CW
+003D   2???           00279     goto    enc_read_complete
+                      00280 
+003E                  00281 enc_idle_check_a
+003E   1805           00282     btfsc   PORTA,ENCODER_A_BIT
+003F   2???           00283     goto    enc_read_complete
+                      00284 
+0040   01A2           00285     clrf    encoder_state
+0041   1522           00286     bsf     encoder_state,ENCODER_STATE_CCW
+0042   2???           00287     goto    enc_read_complete
+                      00288 
+                      00289     ; Handle the CW state.
+0043                  00290 enc_cw
+0043   1C85           00291     btfss   PORTA,ENCODER_B_BIT
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  7
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+0044   2???           00292     goto    enc_cw_check_a
+                      00293 
+0045   01A2           00294     clrf    encoder_state
+0046   1422           00295     bsf     encoder_state,ENCODER_STATE_IDLE
+0047   2???           00296     goto    enc_read_complete
+                      00297 
+0048                  00298 enc_cw_check_a
+0048   1805           00299     btfsc   PORTA,ENCODER_A_BIT
+0049   2???           00300     goto    enc_read_complete
+                      00301 
+004A   01A3           00302     clrf    encoder_direction
+004B   1423           00303     bsf     encoder_direction,ENCODER_DIR_CW
+004C   01A2           00304     clrf    encoder_state
+004D   15A2           00305     bsf     encoder_state,ENCODER_STATE_WAIT
+004E   0AA4           00306     incf    encoder_position,F
+004F   3018           00307     movlw   0x18
+0050   0624           00308     xorwf   encoder_position,W
+0051   1903           00309     btfsc   STATUS,Z
+0052   01A4           00310     clrf    encoder_position
+                      00311 ;    bcf     PORTA,ENCODER_LED_R_BIT
+                      00312 ;    bsf     PORTA,ENCODER_LED_G_BIT
+0053   2???           00313     goto    enc_read_complete
+                      00314 
+                      00315     ; Handle the CCW state.
+0054                  00316 enc_ccw
+0054   1C05           00317     btfss   PORTA,ENCODER_A_BIT
+0055   2???           00318     goto    enc_ccw_check_b
+                      00319 
+0056   01A2           00320     clrf    encoder_state
+0057   1422           00321     bsf     encoder_state,ENCODER_STATE_IDLE
+0058   2???           00322     goto    enc_read_complete
+                      00323 
+0059                  00324 enc_ccw_check_b
+0059   1885           00325     btfsc   PORTA,ENCODER_B_BIT
+005A   2???           00326     goto    enc_read_complete
+                      00327 
+005B   01A3           00328     clrf    encoder_direction
+005C   14A3           00329     bsf     encoder_direction,ENCODER_DIR_CCW
+005D   01A2           00330     clrf    encoder_state
+005E   15A2           00331     bsf     encoder_state,ENCODER_STATE_WAIT
+                      00332 
+                      00333 
+                      00334 ;    bsf     PORTA,ENCODER_LED_R_BIT
+                      00335 ;    bcf     PORTA,ENCODER_LED_G_BIT
+                      00336 
+005F   03A4           00337     decf    encoder_position,F
+0060   1FA4           00338     btfss   encoder_position,7
+0061   2???           00339     goto    enc_read_complete
+                      00340 
+0062   3017           00341     movlw   0x17
+0063   00A4           00342     movwf   encoder_position
+0064   2???           00343     goto    enc_read_complete
+                      00344 
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  8
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00345     ; Handle the WAIT state.
+0065                  00346 enc_wait
+0065   1C05           00347     btfss   PORTA,ENCODER_A_BIT
+0066   2???           00348     goto    enc_read_complete
+                      00349 
+0067   1C85           00350     btfss   PORTA,ENCODER_B_BIT
+0068   2???           00351     goto    enc_read_complete
+                      00352 
+0069   01A2           00353     clrf    encoder_state
+006A   1422           00354     bsf     encoder_state,ENCODER_STATE_IDLE
+006B   2???           00355     goto    enc_read_complete
+                      00356 
+006C                  00357 enc_read_complete
+                      00358 
+006C   0008           00359     return
+                      00360 
+                      00361 ;  Encoder Module : END
+                      00362 ;
+                      00363 ; ------------------------------------------------------------------------------
+                      00364 
+                      00365 
+                      00366 ; ------------------------------------------------------------------------------
+                      00367 ;
+                      00368 ;  Timer 1 Module
+                      00369 ;
+                      00370 ;  This module handles the timing for buttons and led's.  The timer will be set
+                      00371 ;  to interrupt every 2000 ticks.  This provides an interrupt every millisecond.
+                      00372 ;  This will be the LED update rate.  With 16 brightness levels, this is
+                      00373 
+                      00374 ;  The reload value is 65536-2000 = 0FB30H.  This will cause an interrupt on
+                      00375 ;  overflow every 1ms.
+  00000030            00376 timer_reload_low        equ             030H
+  000000FB            00377 timer_reload_high       equ             0FBH
+                      00378 
+                      00379 ;  Routine - timer_init : Set up the timer to give us an interrupt every 1ms.
+                      00380 ;  The isr code for this must be VERY lightweight.
+                      00381 
+006D                  00382 timer_init
+                      00383 
+                      00384     bank0
+006D   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+006E   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+006F   1090           00385     bcf     T1CON,TMR1CS    ; Select internal clock.
+0070   1110           00386     bcf     T1CON,T1INSYNC  ; Not required for internal clock.
+0071   1190           00387     bcf     T1CON,T1OSCEN   ; Do not enable timer 1 oscillator.
+0072   1210           00388     bcf     T1CON,T1CKPS0   ; Prescaler 1:1
+0073   1290           00389     bcf     T1CON,T1CKPS1
+                      00390 
+0074   01A0           00391         clrf    mstimerl
+0075   01A1           00392         clrf    mstimerh
+                      00393 
+0076   30FB           00394     movlw   timer_reload_high
+0077   008F           00395     movwf   TMR1H
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE  9
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+0078   3030           00396     movlw   timer_reload_low
+0079   008E           00397     movwf   TMR1L
+                      00398 
+007A   100C           00399         bcf             PIR1,TMR1IF                             ;  Clear any pending interrupt.
+                      00400         bank1
+007B   1683               M                 bsf             STATUS, RP0 ; Set RP0 bit = Bank1
+007C   1303               M                 bcf             STATUS, RP1
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+007D   140C           00401         bsf             PIE1,TMR1IE                             ;  Enable the interrupts
+                      00402         bank0
+007E   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+007F   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+0080   1410           00403         bsf             T1CON,TMR1ON                    ;  Start the timer.
+0081   0008           00404         return
+                      00405 
+                      00406 
+                      00407 ;  Routine - timer_isr : This is called from the interrupt routine if a timer1
+                      00408 ;  interrupt is detected.
+                      00409 
+0082                  00410 timer_isr
+                      00411 
+                      00412         bank0
+0082   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+0083   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+0084   1C0C           00413         btfss   PIR1,TMR1IF                             ;  Check for timer 1 interrupt.
+0085   2???           00414         goto    timer_isr_return                ;  If not, return.
+                      00415 
+0086   1010           00416         bcf             T1CON,TMR1ON                    ;  Turn off the timer.
+                      00417 
+0087   0AA0           00418         incf    mstimerl,F                              ;  Increment mstimer.
+0088   1903           00419         btfsc   STATUS,Z
+0089   0AA1           00420         incf    mstimerh,F
+008A   3030           00421         movlw   timer_reload_low                ;  Get low timer value.
+008B   008E           00422         movwf   TMR1L                                   ;  Set low byte.
+008C   30FB           00423         movlw   timer_reload_high               ;  Get high timer value.
+008D   008F           00424         movwf   TMR1H                                   ;  Set high byte.
+                      00425 
+008E   100C           00426         bcf             PIR1,TMR1IF                             ;  Clear any pending interrupt.
+008F   1410           00427         bsf             T1CON,TMR1ON                    ;  Turn timer back on.
+                      00428 
+0090   2???           00429     call    tick_list               ;  Handle everything that needs a tick.
+                      00430 
+0091                  00431 timer_isr_return
+0091   0008           00432         return
+                      00433 
+                      00434 ;  Timer Module : END
+                      00435 ;
+                      00436 ; ------------------------------------------------------------------------------
+                      00437 
+                      00438 ; ------------------------------------------------------------------------------
+                      00439 ;
+                      00440 ;  LED Module
+                      00441 ;
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 10
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00442 ;  This module handles the interaction with the LEDs.
+                      00443 ;
+                      00444 ;  Definitions
+                      00445 ;
+                      00446 ;       LED R   Port A2     GND is On
+                      00447 ;       LED G   Port A3
+                      00448 ;       LED B   Port A4
+                      00449 
+  00000002            00450 LED_R_BIT   EQU 2
+  00000003            00451 LED_G_BIT   EQU 3
+  00000004            00452 LED_B_BIT   EQU 4
+                      00453 
+                      00454 ;  Routine - led_init : Setup the processor for writing to the LED registers.
+0092                  00455 led_init
+                      00456 
+                      00457         ;  Set up the bits to control the LEDs.
+                      00458         bank1
+0092   1683               M                 bsf             STATUS, RP0 ; Set RP0 bit = Bank1
+0093   1303               M                 bcf             STATUS, RP1
+0094   3007           00459     movlw   0x07
+0095   0085           00460     movwf   PORTA               ; Turn off IO pins.
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0096   1105           00461         bcf             TRISA,LED_R_BIT
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0097   1185           00462     bcf     TRISA,LED_G_BIT
+Message[302]: Register in operand not in bank 0.  Ensure that bank bits are correct.
+0098   1205           00463     bcf     TRISA,LED_B_BIT
+                      00464 
+                      00465         ;  That's it.
+0099   0008           00466         return
+                      00467 
+                      00468 ;  Routine - led_set_intensity : This routine checks the expected state of all the
+                      00469 ;  leds and sets their next value into the 3 led locations.
+                      00470 ;
+                      00471 ;  The intensity is determined by the following:
+                      00472 ;
+                      00473 ;               led intensity byte : mmffiiii
+                      00474 ;
+                      00475 ;  When m = 0 then i is the intensity of the led from 0-15.  0 is off and 15 is almost
+                      00476 ;                                       always on.
+                      00477 ;  When m = 1 then the following applies:
+                      00478 ;                       f=0 : flash at 1 Hz, f=1 : flash at 2 Hz, f=2 flash at 4 Hz, f=3 8 Hz
+                      00479 
+009A                  00480 led_tick
+                      00481 
+                      00482         bank0                                   ;  This all happens in bank 0.
+009A   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+009B   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+                      00483 
+                      00484         ; Precalculate the flash values.  led_flash bit 0 will flash at ~8 hz while
+                      00485     ; led_flash bit 3 will flash at ~1hz.
+009C   0820           00486         movfw   mstimerl
+009D   00A6           00487         movwf   ledshift
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 11
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+009E   0821           00488         movfw   mstimerh
+009F   00A7           00489         movwf   led_flash
+00A0   3903           00490     andlw   0x03
+00A1   1003           00491     bcf     STATUS,C
+00A2   0DA6           00492         rlf             ledshift,F
+00A3   0DA7           00493         rlf             led_flash,F
+00A4   0DA6           00494         rlf             ledshift,F
+00A5   0DA7           00495         rlf             led_flash,F
+                      00496 
+00A6   01A9           00497     clrf    led_value       ;  Used to hold the values of the bits.
+                      00498 
+                      00499     ; Loop through each of the led intensity values, so that each led can be set.
+00A7   3003           00500         movlw   3                               ;  Loop counter for setting each led.
+00A8   00A5           00501         movwf   ledcount                ;  Save it in count.
+00A9   3072           00502         movlw   led_intensity+3-1       ;  Set the indirect memory pointer.
+00AA   0084           00503         movwf   FSR
+00AB   1383           00504         bcf             STATUS,IRP              ;  Led intensity bytes locations are not higher than 255
+                            .
+                      00505 
+                      00506 ;  The low 4 bits of the led intensity are what we need to set it to.
+00AC                  00507 led_set_intensity_loop
+00AC   0820           00508         movfw   mstimerl                        ;  Get low byte of the millisecond timer.
+00AD   390F           00509         andlw   00f                             ;  Clear it.
+00AE   00A8           00510         movwf   led_tmp                 ;  Save it.
+00AF   0800           00511         movfw   INDF                    ;  Get the intensity.
+00B0   390F           00512         andlw   00f                             ;  Clear all other bits.
+00B1   0228           00513         subwf   led_tmp,W               ;  Subtract mstimer-intensity.
+                      00514 
+                      00515         ;  If carry is set, LED should be off.
+Message[305]: Using default destination of 1 (file).
+00B2   0DA9           00516     rlf     led_value       ;  Move the value of this led into the holding location.
+                      00517 
+                      00518     ;  Now check to see if this led should be flashing.
+00B3   0800           00519         movfw   INDF
+00B4   39C0           00520         andlw   0xC0            ;  Get mode bits.
+00B5   3A40           00521     xorlw   0x40
+00B6   1D03           00522     btfss   STATUS,Z        ;  Skip if we should flash.
+00B7   2???           00523     goto    led_loop_check
+                      00524 
+                      00525     ;  Get the flash value.
+00B8   0800           00526     movfw   INDF
+00B9   3930           00527     andlw   0x30            ;  Get flash bits.
+00BA   3A30           00528     xorlw   0x30            ;  Complement the bits.
+00BB   00A8           00529     movwf   led_tmp      ;  Move to temp location.
+00BC   0EA8           00530     swapf   led_tmp,f      ;  Count for shifting now in ledshift.
+                      00531 
+00BD   0827           00532     movfw   led_flash
+00BE   00A6           00533     movwf   ledshift
+00BF   1003           00534     bcf     STATUS,C
+                      00535 
+00C0                  00536 led_set_intensity_flash_loop
+00C0   0CA6           00537         rrf             ledshift,F
+00C1   0BA8           00538         decfsz  led_tmp,F
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 12
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+00C2   2???           00539     goto    led_set_intensity_flash_loop
+                      00540 
+Message[305]: Using default destination of 1 (file).
+00C3   0CA6           00541     rrf     ledshift        ; Flash bit is now in carry.
+00C4   1803           00542     btfsc   STATUS,C
+00C5   2???           00543     goto    led_loop_check
+                      00544 
+00C6   1029           00545     bcf     led_value,0
+                      00546 
+                      00547         ;  Check to see if we need to keep doing this.
+00C7                  00548 led_loop_check
+00C7   0384           00549         decf    FSR,F
+00C8   0BA5           00550         decfsz  ledcount,F
+00C9   2???           00551         goto    led_set_intensity_loop
+                      00552 
+                      00553     ; Write the value to the port.
+00CA   1003           00554     bcf     STATUS,C
+Message[305]: Using default destination of 1 (file).
+00CB   0DA9           00555     rlf     led_value
+Message[305]: Using default destination of 1 (file).
+00CC   0DA9           00556     rlf     led_value
+00CD   0829           00557     movfw   led_value
+00CE   0085           00558     movwf   PORTA
+                      00559 
+00CF                  00560 led_tick_return
+00CF   0008           00561         return
+                      00562 
+                      00563 ;  LED Module : END
+                      00564 ;
+                      00565 ; ------------------------------------------------------------------------------
+                      00566 
+                      00567 
+                      00568 ; ------------------------------------------------------------------------------
+                      00569 ;
+                      00570 ;  Start up the main program.  Call the initialization routines for each of the
+                      00571 ;  modules.
+                      00572 
+00D0                  00573 main
+                      00574 
+00D0   2???           00575     call    system_init     ;  Initialize system.
+00D1   2???           00576     call    timer_init      ;  Initialize timer.
+00D2   2???           00577     call    encoder_init    ;  Initialize encoder.
+00D3   2???           00578     call    led_init        ;  Initialize led.
+                      00579 
+                      00580         ;  Enable interrupts.
+                      00581     bank0
+00D4   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+00D5   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+00D6   170B           00582     bsf     INTCON,PEIE     ; Enable peripheral interrupts.
+00D7   178B           00583     bsf     INTCON,GIE      ; Enable global interrupts.
+                      00584 
+                      00585 ; Set the leds to some test values.
+00D8   304F           00586     movlw   0x4f
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 13
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+00D9   00F0           00587     movwf   led_intensity
+00DA   3000           00588     movlw   0x00
+00DB   00F1           00589     movwf   led_intensity+1
+00DC   3000           00590     movlw   0x00
+00DD   00F2           00591     movwf   led_intensity+2
+                      00592 
+00DE                  00593 self1
+00DE   2???           00594     goto    self1
+00DF   0824           00595     movfw   encoder_position
+00E0   01F0           00596     clrf   led_intensity
+00E1   00F1           00597     movwf   led_intensity+1
+00E2   01F2           00598     clrf   led_intensity+2
+00E3   2???           00599     goto    self1
+                      00600 
+                      00601 ;  Temp testing code.
+                      00602 
+00E4                  00603 self
+                      00604     bank0
+00E4   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+00E5   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+00E6   0824           00605     movfw   encoder_position
+00E7   1D03           00606     btfss   STATUS,Z
+00E8   2???           00607     goto    self_clear_r
+                      00608 
+00E9   1105           00609     bcf     PORTA,ENCODER_LED_R_BIT
+00EA   2???           00610     goto    self
+                      00611 
+00EB                  00612 self_clear_r
+00EB   1505           00613     bsf     PORTA,ENCODER_LED_R_BIT
+00EC   2???           00614     goto    self
+                      00615 
+                      00616 
+                      00617     bank0
+00ED   1283               M                 bcf             STATUS, RP0 ; Reset RP0 bit = Bank0
+00EE   1303               M                 bcf             STATUS, RP1     ; Reset RP1
+00EF   1D21           00618     btfss   mstimerh,2
+00F0   2???           00619     goto    clearled
+00F1   1505           00620     bsf     PORTA,2
+00F2   2???           00621     goto    greenled
+                      00622 
+00F3                  00623 clearled
+                      00624 
+00F3   1105           00625     bcf     PORTA,2
+                      00626 
+00F4                  00627 greenled
+                      00628 
+00F4   1CA1           00629     btfss   mstimerh,1
+00F5   2???           00630     goto    cleargreenled
+00F6   1585           00631     bsf     PORTA,3
+00F7   2???           00632     goto    self
+                      00633 
+00F8                  00634 cleargreenled
+                      00635 
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 14
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+00F8   1185           00636     bcf     PORTA,3
+00F9   2???           00637     goto self
+                      00638 
+                      00639 ; Routine - tick_list : This is a list of all the routines that need to be
+                      00640 ; called on 1ms boundaries.
+                      00641 
+00FA                  00642 tick_list
+                      00643 
+00FA   2???           00644     call    encoder_tick
+00FB   2???           00645     call    led_tick
+00FC   0008           00646     return
+                      00647 
+                      00648 ; End of main program.
+                      00649 ;
+                      00650 ; ------------------------------------------------------------------------------
+                      00651 
+3F10 0000             00652         end
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 15
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+ADDEN                             00000003
+BF                                00000000
+BRGH                              00000002
+C                                 00000000
+C1INV                             00000004
+C1OUT                             00000006
+C2INV                             00000005
+C2OUT                             00000007
+CCP1CON                           00000017
+CCP1IE                            00000002
+CCP1IF                            00000002
+CCP1M0                            00000000
+CCP1M1                            00000001
+CCP1M2                            00000002
+CCP1M3                            00000003
+CCP1X                             00000005
+CCP1Y                             00000004
+CCPR1                             00000015
+CCPR1H                            00000016
+CCPR1L                            00000015
+CIS                               00000003
+CKE                               00000006
+CKP                               00000004
+CM0                               00000000
+CM1                               00000001
+CM2                               00000002
+CMCON                             0000009C
+CMIE                              00000006
+CMIF                              00000006
+CREN                              00000004
+CSRC                              00000007
+CVR0                              00000000
+CVR1                              00000001
+CVR2                              00000002
+CVR3                              00000003
+CVRCON                            0000009D
+CVREN                             00000007
+CVROE                             00000006
+CVRR                              00000005
+D                                 00000005
+DATA_ADDRESS                      00000005
+DC                                00000001
+DEVICE_TYPE_BUTTONS               00000001
+DEVICE_VERSION_MAJOR              00000000
+DEVICE_VERSION_MINOR              0000000C
+D_A                               00000005
+D_NOT_A                           00000005
+EEADR                             0000010D
+EEADRH                            0000010F
+EECON1                            0000018C
+EECON2                            0000018D
+EEDATA                            0000010C
+EEDATH                            0000010E
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 16
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+EEIE                              00000004
+EEIF                              00000004
+EEPGD                             00000007
+ENCODER_A_BIT                     00000000
+ENCODER_BUTTON_BIT                00000005
+ENCODER_B_BIT                     00000001
+ENCODER_DIR_CCW                   00000001
+ENCODER_DIR_CW                    00000000
+ENCODER_LED_B_BIT                 00000004
+ENCODER_LED_G_BIT                 00000003
+ENCODER_LED_R_BIT                 00000002
+ENCODER_STATE_CCW                 00000002
+ENCODER_STATE_CW                  00000001
+ENCODER_STATE_IDLE                00000000
+ENCODER_STATE_WAIT                00000003
+F                                 00000001
+FERR                              00000002
+FREE                              00000004
+FSR                               00000004
+GIE                               00000007
+I2C_DATA                          00000005
+I2C_READ                          00000002
+I2C_START                         00000003
+I2C_STOP                          00000004
+INDF                              00000000
+INT0IE                            00000004
+INT0IF                            00000001
+INTCON                            0000000B
+INTE                              00000004
+INTEDG                            00000006
+INTF                              00000001
+IOFS                              00000002
+IRCF0                             00000004
+IRCF1                             00000005
+IRCF2                             00000006
+IRP                               00000007
+LED_B_BIT                         00000004
+LED_G_BIT                         00000003
+LED_R_BIT                         00000002
+NOT_A                             00000005
+NOT_ADDRESS                       00000005
+NOT_BO                            00000000
+NOT_BOR                           00000000
+NOT_PD                            00000003
+NOT_POR                           00000001
+NOT_RBPU                          00000007
+NOT_RC8                           00000006
+NOT_T1SYNC                        00000002
+NOT_TO                            00000004
+NOT_TX8                           00000006
+NOT_W                             00000002
+NOT_WRITE                         00000002
+OERR                              00000001
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 17
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+OPTION_REG                        00000081
+OSCCON                            0000008F
+OSCTUNE                           00000090
+OSFIE                             00000007
+OSFIF                             00000007
+OSTS                              00000003
+P                                 00000004
+PCL                               00000002
+PCLATH                            0000000A
+PCON                              0000008E
+PEIE                              00000006
+PIE1                              0000008C
+PIE2                              0000008D
+PIR1                              0000000C
+PIR2                              0000000D
+PORTA                             00000005
+PORTB                             00000006
+PR2                               00000092
+PS0                               00000000
+PS1                               00000001
+PS2                               00000002
+PSA                               00000003
+R                                 00000002
+RA0                               00000000
+RA1                               00000001
+RA2                               00000002
+RA3                               00000003
+RA4                               00000004
+RA5                               00000005
+RA6                               00000006
+RA7                               00000007
+RB0                               00000000
+RB1                               00000001
+RB2                               00000002
+RB3                               00000003
+RB4                               00000004
+RB5                               00000005
+RB6                               00000006
+RB7                               00000007
+RBIE                              00000003
+RBIF                              00000000
+RC8_9                             00000006
+RC9                               00000006
+RCD8                              00000000
+RCIE                              00000005
+RCIF                              00000005
+RCREG                             0000001A
+RCSTA                             00000018
+RD                                00000000
+READ_WRITE                        00000002
+RP0                               00000005
+RP1                               00000006
+RX9                               00000006
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 18
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+RX9D                              00000000
+R_NOT_W                           00000002
+R_W                               00000002
+S                                 00000003
+SCS0                              00000000
+SCS1                              00000001
+SMP                               00000007
+SPBRG                             00000099
+SPEN                              00000007
+SREN                              00000005
+SSPADD                            00000093
+SSPBUF                            00000013
+SSPCON                            00000014
+SSPEN                             00000005
+SSPIE                             00000003
+SSPIF                             00000003
+SSPM0                             00000000
+SSPM1                             00000001
+SSPM2                             00000002
+SSPM3                             00000003
+SSPOV                             00000006
+SSPSTAT                           00000094
+STATUS                            00000003
+SWDTE                             00000000
+SWDTEN                            00000000
+SYNC                              00000004
+T0CS                              00000005
+T0SE                              00000004
+T1CKPS0                           00000004
+T1CKPS1                           00000005
+T1CON                             00000010
+T1INSYNC                          00000002
+T1OSCEN                           00000003
+T1RUN                             00000006
+T2CKPS0                           00000000
+T2CKPS1                           00000001
+T2CON                             00000012
+TMR0                              00000001
+TMR0IE                            00000005
+TMR0IF                            00000002
+TMR1                              0000000E
+TMR1CS                            00000001
+TMR1H                             0000000F
+TMR1IE                            00000000
+TMR1IF                            00000000
+TMR1L                             0000000E
+TMR1ON                            00000000
+TMR2                              00000011
+TMR2IE                            00000001
+TMR2IF                            00000001
+TMR2ON                            00000002
+TOUTPS0                           00000003
+TOUTPS1                           00000004
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 19
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+TOUTPS2                           00000005
+TOUTPS3                           00000006
+TRISA                             00000085
+TRISA0                            00000000
+TRISA1                            00000001
+TRISA2                            00000002
+TRISA3                            00000003
+TRISA4                            00000004
+TRISA5                            00000005
+TRISA6                            00000006
+TRISA7                            00000007
+TRISB                             00000086
+TRISB0                            00000000
+TRISB1                            00000001
+TRISB2                            00000002
+TRISB3                            00000003
+TRISB4                            00000004
+TRISB5                            00000005
+TRISB6                            00000006
+TRISB7                            00000007
+TRMT                              00000001
+TUN0                              00000000
+TUN1                              00000001
+TUN2                              00000002
+TUN3                              00000003
+TUN4                              00000004
+TUN5                              00000005
+TX8_9                             00000006
+TX9                               00000006
+TX9D                              00000000
+TXD8                              00000000
+TXEN                              00000005
+TXIE                              00000004
+TXIF                              00000004
+TXREG                             00000019
+TXSTA                             00000098
+UA                                00000001
+W                                 00000000
+WCOL                              00000007
+WDTCON                            00000105
+WDTPS0                            00000001
+WDTPS1                            00000002
+WDTPS2                            00000003
+WDTPS3                            00000004
+WR                                00000001
+WREN                              00000002
+WRERR                             00000003
+Z                                 00000002
+_BODEN_OFF                        00003FBF
+_BODEN_ON                         00003FFF
+_BOREN_OFF                        00003FBF
+_BOREN_ON                         00003FFF
+_CCP1_RB0                         00003FFF
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 20
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+_CCP1_RB3                         00002FFF
+_CCPMX_RB0                        00003FFF
+_CCPMX_RB3                        00002FFF
+_CONFIG1                          00002007
+_CONFIG2                          00002008
+_CPD_OFF                          00003FFF
+_CPD_ON                           00003EFF
+_CP_ALL                           00001FFF
+_CP_OFF                           00003FFF
+_CP_ON                            00001FFF
+_DEBUG_OFF                        00003FFF
+_DEBUG_ON                         000037FF
+_DEVID1                           00002006
+_EXTCLK                           00003FEF
+_EXTRC_CLKOUT                     00003FFF
+_EXTRC_IO                         00003FFE
+_FCMEN_OFF                        00003FFE
+_FCMEN_ON                         00003FFF
+_FOSC_EC                          00003FEF
+_FOSC_EXTRCCLK                    00003FFF
+_FOSC_EXTRCIO                     00003FFE
+_FOSC_HS                          00003FEE
+_FOSC_INTOSCCLK                   00003FFD
+_FOSC_INTOSCIO                    00003FFC
+_FOSC_LP                          00003FEC
+_FOSC_XT                          00003FED
+_HS_OSC                           00003FEE
+_IDLOC0                           00002000
+_IDLOC1                           00002001
+_IDLOC2                           00002002
+_IDLOC3                           00002003
+_IESO_OFF                         00003FFD
+_IESO_ON                          00003FFF
+_INTRC_CLKOUT                     00003FFD
+_INTRC_IO                         00003FFC
+_LP_OSC                           00003FEC
+_LVP_OFF                          00003F7F
+_LVP_ON                           00003FFF
+_MCLRE_OFF                        00003FDF
+_MCLRE_ON                         00003FFF
+_MCLR_OFF                         00003FDF
+_MCLR_ON                          00003FFF
+_PWRTE_OFF                        00003FFF
+_PWRTE_ON                         00003FF7
+_WDTE_OFF                         00003FFB
+_WDTE_ON                          00003FFF
+_WDT_OFF                          00003FFB
+_WDT_ON                           00003FFF
+_WRT_2048                         00003BFF
+_WRT_256                          00003DFF
+_WRT_ALL                          000039FF
+_WRT_OFF                          00003FFF
+_WRT_PROTECT_2048                 00003BFF
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 21
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+_WRT_PROTECT_256                  00003DFF
+_WRT_PROTECT_ALL                  000039FF
+_WRT_PROTECT_OFF                  00003FFF
+_XT_OSC                           00003FED
+__16F87                           00000001
+__DEBUG                           
+bank0                             
+bank1                             
+cleargreenled                     000000F8
+clearled                          000000F3
+enc_ccw                           00000054
+enc_ccw_check_b                   00000059
+enc_cw                            00000043
+enc_cw_check_a                    00000048
+enc_idle                          00000039
+enc_idle_check_a                  0000003E
+enc_read_complete                 0000006C
+enc_wait                          00000065
+encoder_direction                 00000023
+encoder_init                      00000020
+encoder_position                  00000024
+encoder_state                     00000022
+encoder_tick                      0000002E
+greenled                          000000F4
+led_flash                         00000027
+led_init                          00000092
+led_intensity                     00000070
+led_loop_check                    000000C7
+led_set_intensity_flash_loop      000000C0
+led_set_intensity_loop            000000AC
+led_tick                          0000009A
+led_tick_return                   000000CF
+led_tmp                           00000028
+led_value                         00000029
+ledcount                          00000025
+ledshift                          00000026
+main                              000000D0
+mstimerh                          00000021
+mstimerl                          00000020
+ram                               00000020
+self                              000000E4
+self1                             000000DE
+self_clear_r                      000000EB
+system_halt                       0000001F
+system_init                       00000008
+system_isr                        00000011
+system_isr_return                 00000018
+system_save_fsr                   0000007F
+system_save_status                0000007E
+system_save_w                     0000007D
+tick_list                         000000FA
+timer_init                        0000006D
+timer_isr                         00000082
+MPASM  5.46  /USERS/MICHAEL/DESKTOP/TACK SA M   8-16-2012  20:01:30         PAGE 22
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+timer_isr_return                  00000091
+timer_reload_high                 000000FB
+timer_reload_low                  00000030
+user_button_events                00000073
+user_button_events_end            00000083
+
+Errors   :     0
+Warnings :     0 reported,     0 suppressed
+Messages :    15 reported,     0 suppressed
+
+
